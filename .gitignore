@@ -1,0 +1,32 @@
+# ⛔ 排除 Milvus 的 volume 資料（避免追蹤二進位/日誌檔）
+volumes/
+
+# ✅ 若你使用 Docker，可排除其他常見容器產生的目錄
+*.log
+*.pid
+*.sock
+*.db
+*.rdb
+*.aof
+
+# ❌ 排除 Python 虛擬環境（若有）
+venv/
+.env
+
+# ❌ 排除 IDE 編輯器設定
+.vscode/
+.idea/
+
+# ❌ __pycache__ 為 Python 編譯暫存
+__pycache__/
+*.py[cod]
+
+# ❌ Jupyter Notebook Checkpoint
+.ipynb_checkpoints/
+
+# ✅ 若使用 Milvus Docker Compose，可以排除 compose 產生的檔案
+docker-compose.override.yml
+
+# webui 先不放
+webui/
+.flask_ip

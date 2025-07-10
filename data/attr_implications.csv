@@ -1,0 +1,11 @@
+antecedent,consequent,confidence
+cellular_component,anatomy,0.8524219326284731
+molecular_function,anatomy,0.8173258003766478
+pathway,anatomy,0.8674605229096558
+cellular_component,biological_process,0.8807474797147775
+molecular_function,biological_process,0.8378431955595202
+pathway,biological_process,0.9258779877470016
+cellular_component,molecular_function,0.8482419473813622
+molecular_function,cellular_component,0.8548419070274555
+pathway,cellular_component,0.9286392268530502
+pathway,molecular_function,0.9138838553801019

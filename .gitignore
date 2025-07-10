@@ -28,5 +28,8 @@ __pycache__/
 docker-compose.override.yml
 
 # webui 先不放
-webui/
+open-webui/
 .flask_ip
+
+# 大檔案
+data/triplets.tsv

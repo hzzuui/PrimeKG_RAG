@@ -33,3 +33,6 @@ open-webui/
 
 # 大檔案
 data/triplets.tsv
+data/disease_features.csv
+data/neo4j_triples.json
+neo4j_path.json

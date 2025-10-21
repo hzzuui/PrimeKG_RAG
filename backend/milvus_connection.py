@@ -30,6 +30,7 @@ def create_collection(name=COLLECTION_NAME, dim=768):
             FieldSchema(name="source_name", dtype=DataType.VARCHAR, max_length=255),
             FieldSchema(name="relation_type", dtype=DataType.VARCHAR, max_length=255),
             FieldSchema(name="target_name", dtype=DataType.VARCHAR, max_length=255),
+            FieldSchema(name="triple_text", dtype=DataType.VARCHAR, max_length=2000),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim)
         ]
     elif name == "collection_kge":
@@ -59,7 +60,7 @@ def create_collection(name=COLLECTION_NAME, dim=768):
     collection.create_index(
         field_name="embedding",
         index_params={
-            "metric_type": "L2",
+            "metric_type": "IP",
             "index_type": "IVF_FLAT",
             "params": {"nlist": 1024}
         }
@@ -113,3 +114,4 @@ if __name__ == "__main__":
     connect_milvus()
     get_collection()
     close_milvus()
+    

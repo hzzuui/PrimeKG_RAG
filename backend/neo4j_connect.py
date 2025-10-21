@@ -4,7 +4,7 @@ from neo4j import GraphDatabase
 NEO4J_URI = "bolt://localhost:7687"  # 確保 Neo4j 服務已啟動
 #NEO4J_URI = "bolt://172.23.160.1:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "20010308"  
+NEO4J_PASSWORD = "primekg666"  #自行更換密碼
 NEO4J_DATABASE = "primekg"  
 
 class Neo4jConnection:

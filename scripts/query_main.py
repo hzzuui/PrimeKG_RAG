@@ -64,6 +64,8 @@ def hybrid_retrieval_and_llm(query, text_model, kge_collection, text_collection)
     query_text = text_model.encode(query).tolist()
     search_param = {"metric_type": "L2", "params": {"nprobe": 10}}
 
+
+    # === Text Retrieval ===
     text_results = text_collection.search(
         data=[query_text],
         anns_field="embedding",
@@ -77,6 +79,7 @@ def hybrid_retrieval_and_llm(query, text_model, kge_collection, text_collection)
         related_entities.add(r.entity.get("source_name"))
         related_entities.add(r.entity.get("target_name"))
 
+    # === KGE Retrieval ===
     matched_vecs = [entity_to_vec[name] for name in related_entities if name in entity_to_vec]
     if not matched_vecs:
         matched_vecs = [np.zeros(50).tolist()]
@@ -90,31 +93,39 @@ def hybrid_retrieval_and_llm(query, text_model, kge_collection, text_collection)
     )
 
     # === 🧠 新增屬性推論部分 ===
-    reasoning_output = ""
-    for entity in related_entities:
-        if entity in entity_attr_map:
-            known_attrs = entity_attr_map[entity]
-            inferred_attrs = infer_attributes(known_attrs, attribute_graph)
-            reasoning_output += f"\nEntity: {entity}\nKnown: {known_attrs}\nInferred: {inferred_attrs}\n"
+    # reasoning_output = ""
+    # for entity in related_entities:
+    #     if entity in entity_attr_map:
+    #         known_attrs = entity_attr_map[entity]
+    #         inferred_attrs = infer_attributes(known_attrs, attribute_graph)
+    #         reasoning_output += f"\nEntity: {entity}\nKnown: {known_attrs}\nInferred: {inferred_attrs}\n"
 
-    # === 拼接 context 給 LLM ===
+    # === 拼接 context 給 LLM (Milvus + KGE) ===
     context = ""
     for r in text_results[0]:
         context += f"{r.entity.get('source_name')} -[{r.entity.get('relation_type')}]→ {r.entity.get('target_name')}\n"
     for group in kge_results:
         for r in group:
             context += f"KGE Suggestion Entity: {r.entity.get('entity_name')}\n"
+    
+    # === Prompt & LLM 回答 ===
+    prompt = f"根據以下背景知識回答使用者問題：{context}\n問題：{query}\n請用簡明扼要的方式作答。"
+    llm = OllamaLLM(model="gemma:2b")
+    response = llm.invoke(prompt)
 
-    # ✅ 插入屬性推論補充
-    context += f"\n[屬性邏輯推論]\n{reasoning_output}"
-
-    prompt = prompt_find_connections(context, query)
-    #llm = OllamaLLM(model="gemma:2b")
-    llm = OllamaLLM(base_url="http://127.0.0.1:11435", model="gemma:2b")
-
-    response = llm.invoke(f"{context}\n\n{prompt}")
     print("\n回答內容：\n")
     print(response)
+    
+    # ✅ 插入屬性推論補充
+    # context += f"\n[屬性邏輯推論]\n{reasoning_output}"
+
+    # prompt = prompt_find_connections(context, query)
+    # #llm = OllamaLLM(model="gemma:2b")
+    # llm = OllamaLLM(base_url="http://127.0.0.1:11435", model="gemma:2b")
+
+    # response = llm.invoke(f"{context}\n\n{prompt}")
+    # print("\n回答內容：\n")
+    # print(response)
 
 
 if __name__ == "__main__":

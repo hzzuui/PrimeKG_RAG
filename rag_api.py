@@ -1,368 +1,303 @@
 import time
-from flask import Flask, request, jsonify
-from flask import Response, stream_with_context
-from pymilvus import connections, Collection, utility
-from sentence_transformers import SentenceTransformer
-from langchain_ollama import OllamaLLM
-from flask import Response
 import json
 import warnings
 import sys
 import socket
+import threading
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from pymilvus import connections, Collection, utility
+from sentence_transformers import SentenceTransformer
+from langchain_ollama import OllamaLLM
 from backend.neo4j_connect import Neo4jConnection
 import os
+import numpy as np
 
 # ====== ✅ 忽略不必要的警告 ======
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ====== ✅ Flask 初始化 ======
 app = Flask(__name__)
-CORS(app)  # ← 這行務必加上！
-
+CORS(app)
 
 # ====== ✅ 設定參數 ======
-MILVUS_HOST = "172.23.165.70"
-COLLECTION_NAME = "primekg_rag_paths"
+MILVUS_HOST = "127.0.0.1"
+COLLECTION_NAME = "collection_text"
+COLLECTION_KGE = "collection_kge" 
 EMBED_MODEL = "all-mpnet-base-v2"
-#LLM_MODEL = "gemma:2b"
-LLM_MODEL = "qwen:0.5b"
+DEFAULT_LLM_MODEL = "deepseek-r1:1.5b"  
+DATA_DIR = "data"
 
-# 向量模型與 LLM 延遲載入
+# ====== ✅ 全域變數：延遲載入 Embedding 與 LLM ======
 embedder = None
-llm = None
+llm_cache = {}
+load_lock = threading.Lock()  # 初始化鎖，避免 race condition
 
-# ====== ✅ 啟動前檢查 ======
-# Milvus 啟動檢查
+# ====== ✅ 載入 entity_to_vec (KGE) ======
+print("🔄 載入 entity_to_vec...")
+name_map = {}
+with open(os.path.join(DATA_DIR, "entity_name_map.tsv"), "r", encoding="utf-8") as f:
+    for line in f:
+        safe_id, original_name = line.strip().split("\t")
+        name_map[safe_id] = original_name
+
+entity_embeddings = np.load(os.path.join(DATA_DIR, "entity_embeddings.npy"))
+with open(os.path.join(DATA_DIR, "entity_names.txt"), "r", encoding="utf-8") as f:
+    safe_ids = [line.strip() for line in f if line.strip()]
+
+entity_to_vec = {
+    name_map[safe_id]: vec
+    for safe_id, vec in zip(safe_ids, entity_embeddings)
+    if safe_id in name_map
+}
+print(f"✅ 已載入 entity_to_vec，共 {len(entity_to_vec)} 筆實體")
+
+
+# ====== ✅ 啟動檢查 ======
 def startup_check():
     print("啟動檢查中...")
-
     try:
         connections.connect("default", host=MILVUS_HOST, port="19530")
-        print(f"成功連接 Milvus at {MILVUS_HOST}:19530")
+        print(f"✅ 成功連接 Milvus at {MILVUS_HOST}:19530")
     except Exception as e:
-        print(f"無法連接 Milvus：{e}")
+        print(f"❌ 無法連接 Milvus：{e}")
         sys.exit(1)
 
-    if not utility.has_collection(COLLECTION_NAME):
-        print(f"找不到 Collection：{COLLECTION_NAME}")
-        sys.exit(1)
-
-    col = Collection(COLLECTION_NAME)
-    print(f"找到 Collection：{COLLECTION_NAME}，共 {col.num_entities} 筆資料")
+    for col_name in [COLLECTION_NAME, COLLECTION_KGE]:
+        if not utility.has_collection(col_name):
+            print(f"❌ 找不到 Collection：{col_name}")
+            sys.exit(1)
+        col = Collection(col_name)
+        print(f"✅ 找到 Collection：{col_name}，共 {col.num_entities} 筆資料")
 
     print("API 準備啟動...\n")
 
-# ====== ✅ 主路由：RAG 查詢與 LLM 回應 ======
+# ====== ✅ 路由區 ======
 @app.route("/", methods=["GET"])
 def index():
-    return "RAG API is running!"
+    return "✅ RAG API is running!"
 
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({
+        "embedder_loaded": embedder is not None,
+        "llm_loaded": len(llm_cache) > 0,
+        "kge_loaded": len(entity_to_vec) > 0
+    })
 
-# 測試 Neo4j 是否成功連接並能查資料
 @app.route("/neo_test", methods=["GET"])
 def test_neo4j():
     try:
         conn = Neo4jConnection()
-        test_query = "MATCH (n) RETURN COUNT(n) AS count"
-        result = conn.query(test_query)
+        result = conn.query("MATCH (n) RETURN COUNT(n) AS count")
         conn.close()
-
-        node_count = result[0]["count"] if result else 0
-        return jsonify({"neo4j_status": "connected", "total_nodes": node_count})
+        count = result[0]["count"] if result else 0
+        return jsonify({"neo4j_status": "connected", "total_nodes": count})
     except Exception as e:
         return jsonify({"neo4j_status": "error", "detail": str(e)}), 500
 
-
 @app.route("/rag", methods=["POST"])
 def rag():
-    global embedder, llm
+    global embedder
 
     try:
         user_query = request.json.get("query")
+        mode = request.json.get("mode", "同時顯示兩者")  # 預設為顯示兩者
+        model_name = request.json.get("model", DEFAULT_LLM_MODEL)
+
         print(f"[DEBUG] Query received: {user_query}")
+        print(f"[DEBUG] Mode received: {mode}")
+        print(f"[DEBUG] Model selected: {model_name}")
 
         if not user_query:
             return jsonify({"error": "Query not provided"}), 400
 
-        if embedder is None:
-            print("[DEBUG] Loading embedder...")
-            embedder = SentenceTransformer(EMBED_MODEL)
+        answer_rag = answer_no_rag = None
 
-        query_vector = embedder.encode(user_query).tolist()
+        # ====== 載入 LLM 模型 ======
+        if model_name not in llm_cache:
+            with load_lock:
+                if model_name not in llm_cache:
+                    print(f"[DEBUG] 載入 LLM 模型：{model_name}")
+                    llm_cache[model_name] = OllamaLLM(model=model_name)
+        llm = llm_cache[model_name]
 
-        collection = Collection(COLLECTION_NAME)
-        collection.load()
-        print("[DEBUG] Milvus collection loaded")
+        
 
-        results = collection.search(
-            data=[query_vector],
-            anns_field="embedding",
-            param={"metric_type": "L2", "params": {"nprobe": 10}},
-            limit=5,
-            output_fields=["source_name", "relation_type", "target_name"]
-        )
+        # ====== RAG 回應流程 ======
+        if mode in ["RAG 回應", "同時顯示兩者"]:
+            try:
+                # 載入 embedder
+                if embedder is None:
+                    with load_lock:
+                        if embedder is None:
+                            print("[DEBUG] Loading embedder...")
+                            embedder = SentenceTransformer(EMBED_MODEL)
+                            print("[DEBUG] Embedder loaded")
 
-        context = ""
-        for hit in results[0]:
-            s = hit.entity.get("source_name")
-            r = hit.entity.get("relation_type")
-            t = hit.entity.get("target_name")
-            context += f"{s} --[{r}]--> {t}\n"
+                # 向量化
+                query_vector = embedder.encode(user_query).tolist()
+                print(f"[DEBUG] Query vector generated. Length: {len(query_vector)}")
 
-        prompt = f"""你是一位知識圖譜專家，請根據以下背景知識回答使用者問題：背景知識：{context}問題：{user_query}請用簡明扼要的方式作答。"""
+                # === Step 1: Text 檢索，查詢 Milvus ===
+                collection = Collection(COLLECTION_NAME)
+                collection.load()
+                print("[DEBUG] Milvus collection loaded")
+                results = collection.search(
+                    data=[query_vector],
+                    anns_field="embedding",
+                    param={"metric_type": "L2", "params": {"nprobe": 10}},
+                    limit=5,
+                    output_fields=["source_name", "relation_type", "target_name"]
+                )
+                print(f"[DEBUG] Milvus search returned {len(results[0]) if results else 0} results")
 
-        if llm is None:
-            print(f"[DEBUG] Loading LLM: {LLM_MODEL}")
-            llm = OllamaLLM(model=LLM_MODEL)
+                # 建立 context
+                context = ""
+                related_entities = set()
 
-        answer = llm.invoke(prompt)
-        print("[DEBUG] LLM 回應完成")
+                if results and results[0]:
+                    for hit in results[0]:
+                        s = hit.entity.get("source_name")
+                        r = hit.entity.get("relation_type")
+                        t = hit.entity.get("target_name")
+                        context += f"{s} --[{r}]--> {t}\n"
+                        related_entities.update([s, t])
+                else:
+                    print("[DEBUG] No context found from Milvus(Text)")
 
-        return Response(json.dumps({"answer": answer}, ensure_ascii=False), mimetype="application/json")
-
-    except Exception as e:
-        print(f"[ERROR] {str(e)}")  # ✅ 印出錯誤細節
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/models", methods=["GET"])
-def list_models():
-    return jsonify({
-        "data": [
-            {
-                "id":LLM_MODEL,
-                "object": "model",
-                "owned_by": "rag-api",
-                "permission": [],
-            }
-        ],
-        "object": "list"
-    })
-
-@app.route("/openai/v1/models", methods=["GET"])
-def list_models_openai_format():
-    return jsonify({
-        "object": "list",
-        "data": [
-            {
-                "id": LLM_MODEL,
-                "object": "model",
-                "owned_by": "rag-api",
-                "permission": [],
-            }
-        ]
-    })
-
-'''
-@app.route("/chat/completions", methods=["POST"])
-def proxy_chat_completions():
-    global embedder, llm
-
-    try:
-        body = request.get_json(force=True)  # ✅ 更保險地解析 JSON payload
-        messages = body.get("messages", [])
-        stream = body.get("stream", False)
-
-        user_query = next((m.get("content") for m in reversed(messages) if m.get("role") == "user"), None)
-        if not user_query:
-            return jsonify({"error": "Query not provided"}), 400
-
-        if embedder is None:
-            print("[DEBUG] 載入向量模型...")
-            embedder = SentenceTransformer(EMBED_MODEL)
-
-        query_vector = embedder.encode(user_query).tolist()
-
-        collection = Collection(COLLECTION_NAME)
-        collection.load()
-
-        results = collection.search(
-            data=[query_vector],
-            anns_field="embedding",
-            param={"metric_type": "L2", "params": {"nprobe": 10}},
-            limit=5,
-            output_fields=["source_name", "relation_type", "target_name"]
-        )
-
-        context = ""
-        for hit in results[0]:
-            s = hit.entity.get("source_name")
-            r = hit.entity.get("relation_type")
-            t = hit.entity.get("target_name")
-            context += f"{s} --[{r}]--> {t}\n"
-
-        prompt = f"""你是一位知識圖譜專家，請根據以下背景知識回答使用者問題：背景知識：{context}問題：{user_query}請用簡明扼要的方式作答。"""
-
-        if llm is None:
-            print("[DEBUG] 載入 LLM 模型...")
-            llm = OllamaLLM(model=LLM_MODEL)
-
-        answer = llm.invoke(prompt)
-
-        if stream:
-            def generate():
-                print("[DEBUG] Streaming 回應中...")
-                for chunk in answer.split("\n"):
-                    if chunk.strip():
-                        yield 'data: ' + json.dumps({
-                            "choices": [{
-                                "delta": {"content": chunk + "\n"},
-                                "index": 0,
-                                "finish_reason": None  # ✅ 加上這個欄位
-                            }],
-                            "object": "chat.completion.chunk"
-                        }, ensure_ascii=False) + '\n\n'
-                yield 'data: ' + json.dumps({
-                    "choices": [{
-                        "delta": {},
-                        "index": 0,
-                        "finish_reason": "stop"
-                    }],
-                    "object": "chat.completion.chunk"
-                }) + '\n\n'
-                yield 'data: [DONE]\n\n'
+                
 
 
+                # === Step 2: KGE 檢索 ===
+                if related_entities and entity_to_vec:
+                    print(f"[DEBUG] Doing KGE search for {len(related_entities)} entities...")
+                    matched_vecs = [entity_to_vec[e] for e in related_entities if e in entity_to_vec]
 
-            return Response(stream_with_context(generate()), content_type='text/event-stream')
+                    # fallback
+                    if not matched_vecs:
+                        matched_vecs = [np.zeros(entity_embeddings.shape[1]).tolist()]
 
-        else:
-            return jsonify({
-                "id": "chatcmpl-mockid",
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": answer
-                        },
-                        "finish_reason": "stop"
-                    }
-                ]
-            })
+                    collection_kge = Collection(COLLECTION_KGE)
+                    collection_kge.load()
+                    kge_results = collection_kge.search(
+                        data=matched_vecs,
+                        anns_field="embedding",
+                        param={"metric_type": "L2", "params": {"nprobe": 10}},
+                        limit=3,
+                        output_fields=["entity_name"]
+                    )
+                    for group in kge_results:
+                        for r in group:
+                            context += f"KGE Suggestion Entity: {r.entity.get('entity_name')}\n"
+                            
+                print(f"[DEBUG] Final context:\n{context if context else '[空白]'}")
 
-    except Exception as e:
-        print(f"[ERROR] {str(e)}")
-        return jsonify({"error": str(e)}), 500
-'''
+                # 建立 prompt + 回應
+                if context.strip():
+                    # prompt_rag = f"""
+                    # 你是一位知識圖譜專家。
+                    # 以下包含兩部分檢索結果：
+                    #     1. Text-based retrieval (Neo4j 三元組)
+                    #     2. KGE-based retrieval (結構相似實體)
 
-# ====== ✅ 主路由：RAG 查詢與 LLM 回應 ======
-@app.route("/openai/chat/completions", methods=["POST", "OPTIONS"])
-def proxy_chat_completions():
-    global embedder, llm
-    if request.method == "OPTIONS":
-        return '', 200  # ✅ 回傳 200 表示預檢成功
-    try:
-        # ✅ 印出完整 payload（可在 log 追蹤）
-        body = request.get_json(force=True)
-        print("[DEBUG] 接收到完整 payload:", body)
+                    # 背景知識：{context}
+                    # 問題：{user_query}
+                    # 請用簡明扼要的方式作答。
+                    # """
 
-        # ✅ WebUI 常傳來冗餘欄位，這邊過濾僅取必要欄位
-        messages = body.get("messages", [])
-        if not messages or not isinstance(messages, list):
-            return jsonify({"error": "messages 欄位格式錯誤"}), 400
+                    # prompt_rag = f"""
+                    #     You are a biomedical knowledge graph expert.
 
-        # ✅ 強制關閉 stream 模式進行 debug（先跑通基本流程）
-        stream = False
+                    #     Background knowledge:
+                    #     {context}
 
-        # ✅ 取得最新一筆 user 查詢
-        user_query = next((m.get("content") for m in reversed(messages) if m.get("role") == "user"), None)
-        if not user_query:
-            return jsonify({"error": "找不到 user 提問內容"}), 400
+                    #     Question: {user_query}
 
-        print(f"[DEBUG] 使用者查詢內容: {user_query}")
+                    #     ### Instructions:
+                    #     - Answer ONLY with the exact entity names from the knowledge graph (English).
+                    #     - Provide them as a comma-separated list.
+                    #     - Do NOT translate into Chinese.
+                    #     - Do NOT add explanations or numbers.
+                    #     """
+                    prompt_rag = f"""
+                    You are a biomedical knowledge graph expert.
 
-        # ✅ 載入向量模型
-        if embedder is None:
-            print("[DEBUG] 載入向量模型中...")
-            embedder = SentenceTransformer(EMBED_MODEL)
+                    Background knowledge:
+                    {context}
 
-        # ✅ 查詢 Neo4j 並轉換為向量
-        print("[DEBUG] 查詢 Neo4j 並轉換為向量...")
-        conn = Neo4jConnection()
-        neo4j_query = """
-        MATCH path = (n)-[:bioprocess_protein|pathway_protein|disease_protein|drug_effect|indication|phenotype_protein|drug_protein]-(m)
-        WHERE n.node_name CONTAINS "stem cell" OR n.node_name CONTAINS "regenerative medicine"
-        RETURN path
-        """
-        data = conn.query(neo4j_query)
-        conn.close()
-        print("🔌 Neo4j 連線已關閉")
+                    Question: {user_query}
 
-        # ✅ 查詢結果過濾成上下文關係圖
-        query_vector = embedder.encode(user_query).tolist()
-        results = []
-        seen = set()
-        for i, item in enumerate(data):
-            path = item.get("path", [])
-            if len(path) != 3:
-                continue
-            source_node, relation_type, target_node = path
-            key = (source_node["node_name"], relation_type, target_node["node_name"])
-            if key in seen:
-                continue
-            seen.add(key)
-            results.append(key)
+                    ### Instructions:
+                    - Extract ONLY gene names from the background knowledge above.
+                    - Do NOT output drugs or diseases.
+                    - Respond ONLY in valid JSON, nothing else.
 
-        # ✅ 組合背景知識 context
-        context = "\n".join([f"{s} --[{r}]--> {t}" for s, r, t in results[:5]])
-        prompt = f"""你是一位知識圖譜專家，請根據以下背景知識回答使用者問題：背景知識：{context}問題：{user_query}請用簡明扼要的方式作答。"""
+                    Output format:
+                    {{
+                    "genes": ["CYP3A4", "DRD2", "GRIN2B"]
+                    }}
+                    """
+                    
 
-        # ✅ 載入 LLM 並推理
-        if llm is None:
-            print("[DEBUG] 載入 LLM 模型中...")
-            llm = OllamaLLM(model=LLM_MODEL)
 
-        print("[DEBUG] 呼叫 LLM 生成回答中...")
-        answer = llm.invoke(prompt)
+                    print("[DEBUG] 生成 RAG 回應中...")
+                    answer_rag = llm.invoke(prompt_rag)
+                    # print("[DEBUG] LLM Answer (RAG):", answer_rag)
+                    if not answer_rag.strip():
+                        print("[WARNING] RAG 回應為空字串")
+                else:
+                    answer_rag = "(查無相關知識，無法使用 RAG 回應)"
+            except Exception as e:
+                print(f"[ERROR] RAG 回應失敗：{e}")
+                answer_rag = f"(RAG 回應錯誤：{e})"
 
-        # ✅ 非 streaming 模式下回傳標準格式
+        # ====== no-RAG 回應流程 ======
+        if mode in ["不使用 RAG 回應", "同時顯示兩者"]:
+            try:
+                prompt_no_rag = f"你是一位知識圖譜專家，請根據你自己的知識回答以下問題：{user_query}。請用簡明扼要的方式作答。"
+                print("[DEBUG] 生成 No-RAG 回應中...")
+                answer_no_rag = llm.invoke(prompt_no_rag)
+                print("[DEBUG] LLM Answer (No-RAG):", answer_no_rag)
+                if not answer_no_rag.strip():
+                    print("[WARNING] No-RAG 回應為空字串")
+            except Exception as e:
+                print(f"[ERROR] No-RAG 回應失敗：{e}")
+                answer_no_rag = f"(No-RAG 回應錯誤：{e})"
+
         return jsonify({
-            "id": "chatcmpl-mockid",
-            "object": "chat.completion",
-            "created": int(time.time()),               # ✅ 加上 created timestamp
-            "model": body.get("model", "unknown"),     # ✅ 加上 model 名稱
-            "choices": [
+            "model": model_name,
+            "mode": mode,
+            "query": user_query,
+            "context": context if "context" in locals() else None,
+            "prompt_rag": prompt_rag if "prompt_rag" in locals() else None,
+            "milvus_hits": [
                 {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": answer
-                    },
-                    "finish_reason": "stop"
+                    "source": hit.entity.get("source_name"),
+                    "relation": hit.entity.get("relation_type"),
+                    "target": hit.entity.get("target_name"),
+                    "score": hit.distance
                 }
-            ],
-            "usage": {                                 # ✅ 加上 token 使用情況（暫填寫）
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
+                for hit in results[0]
+            ] if results and results[0] else [],
+            "answer_rag": answer_rag,
+            "answer_no_rag": answer_no_rag
         })
 
     except Exception as e:
-        print(f"[❌ ERROR] ChatCompletions 內部錯誤：{str(e)}")
+        print(f"[FATAL ERROR] {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-
-# 列出可用網址（顯示 IP ）
+# ====== ✅ 顯示網址提示 ======
 def show_access_urls():
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
-    print("透過以下網址訪問 API：")
-    print(f" → 本機測試用： http://127.0.0.1:5000")
-    print(f" → 區網設備用： http://{local_ip}:5000")
+    print("📡 透過以下網址訪問 API：")
+    print(f" → 本機測試用：http://127.0.0.1:5000")
+    print(f" → 區網設備用：http://{local_ip}:5000")
 
-
-# ====== ✅ 啟動 Flask 伺服器 ======
+# ====== ✅ 啟動 Flask ======
 if __name__ == "__main__":
     startup_check()
     show_access_urls()
-
-    # 寫入 open-webui/.flask_ip
-    flask_ip_path = os.path.join(os.path.dirname(__file__), "open-webui", ".flask_ip")
-    local_ip = socket.gethostbyname(socket.gethostname())
-    with open(flask_ip_path, "w") as f:
-        f.write(local_ip)
-
     app.run(host="0.0.0.0", port=5000)
